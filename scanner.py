@@ -3,23 +3,22 @@ import requests
 import time
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 NETWORKS = [
-    "solana",
-    "eth",
-    "base",
-    "bsc",
-    "arbitrum",
-    "polygon_pos",
-    "avax",
-    "optimism"
+    "solana", "eth", "base", "bsc",
+    "arbitrum", "polygon_pos", "avax", "optimism"
 ]
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SEEN_FILE = "state.json"
+
+MIN_LIQUIDITY = 50000
+MIN_VOLUME_24H = 25000
+MAX_POOL_AGE_HOURS = 48
+MAX_ALERTS_PER_SCAN = 3
 
 def load_seen():
     try:
@@ -35,72 +34,120 @@ def save_seen(seen):
 def send_alert(message):
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram secrets missing.")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(
+        response = requests.post(
             url,
             data={"chat_id": CHAT_ID, "text": message},
             timeout=20
         )
+        response.raise_for_status()
+        return True
     except Exception as e:
         print("Telegram error:", e)
+        return False
 
-def scan_network(network, seen):
-    url = f"https://api.geckoterminal.com/api/v2/networks/{network}/new_pools"
+def scan_network(network, seen, alerts):
+    if alerts >= MAX_ALERTS_PER_SCAN:
+        return alerts
+
+    url = (
+        f"https://api.geckoterminal.com/api/v2/"
+        f"networks/{network}/new_pools"
+    )
+
     try:
         response = requests.get(url, timeout=20)
         response.raise_for_status()
         pools = response.json().get("data", [])
 
         for pool in pools:
+            if alerts >= MAX_ALERTS_PER_SCAN:
+                break
+
             pool_id = pool.get("id", "")
             if not pool_id or pool_id in seen:
                 continue
 
             attrs = pool.get("attributes", {})
+
             name = attrs.get("name", "Unknown pool")
             address = attrs.get("address", "")
-            created = attrs.get("pool_created_at", "Unknown")
-            liquidity = attrs.get("reserve_in_usd", "0")
+            created = attrs.get("pool_created_at")
+            liquidity = attrs.get("reserve_in_usd")
+            volume_data = attrs.get("volume_usd", {})
+            volume = volume_data.get("h24") if isinstance(volume_data, dict) else None
+
+            # Reject missing or invalid market data
+            if not created or liquidity is None or volume is None:
+                continue
 
             try:
-                liquidity_value = float(liquidity or 0)
-            except:
-                liquidity_value = 0
+                liquidity = float(liquidity)
+                volume = float(volume)
+                created_at = datetime.fromisoformat(
+                    created.replace("Z", "+00:00")
+                )
+            except (ValueError, TypeError):
+                continue
 
-            if liquidity_value < 5000:
+            age = datetime.now(timezone.utc) - created_at
+
+            if age < timedelta(0):
+                continue
+
+            if age > timedelta(hours=MAX_POOL_AGE_HOURS):
+                continue
+
+            if liquidity < MIN_LIQUIDITY:
+                continue
+
+            if volume < MIN_VOLUME_24H:
                 continue
 
             message = (
-                "🆕 NEW TOKEN POOL DETECTED\n\n"
+                "🔎 STRICT RADAR ALERT\n\n"
                 f"Network: {network}\n"
                 f"Pool: {name}\n"
-                f"Pool address: {address}\n"
-                f"Liquidity: ${liquidity_value:,.0f}\n"
-                f"Created: {created}\n\n"
-                "⚠️ Early discovery only. Safety is NOT verified.\n"
-                "Research carefully before considering any investment."
+                f"Address: {address}\n"
+                f"Liquidity: ${liquidity:,.0f}\n"
+                f"24h volume: ${volume:,.0f}\n"
+                f"Pool age: {age.total_seconds() / 3600:.1f} hours\n\n"
+                "⚠️ Market filters passed only. "
+                "Token safety is NOT verified.\n"
+                "Research before considering any investment."
             )
 
-            send_alert(message)
-            seen.add(pool_id)
-            print("Alerted:", name)
+            if send_alert(message):
+                seen.add(pool_id)
+                alerts += 1
+                print("Strict alert sent:", name)
 
     except Exception as e:
         print(f"Error scanning {network}: {e}")
 
+    return alerts
+
 def main():
     seen = load_seen()
-    print("Radar started:", datetime.now(timezone.utc).isoformat())
+    alerts = 0
+
+    print("Strict Radar started:", datetime.now(timezone.utc).isoformat())
 
     for network in NETWORKS:
-        scan_network(network, seen)
+        if alerts >= MAX_ALERTS_PER_SCAN:
+            break
+
+        alerts = scan_network(network, seen, alerts)
+
+        # Conservative pacing for the public API
         time.sleep(7)
 
     save_seen(seen)
-    print("Radar finished.")
+
+    print("Strict Radar finished. Alerts sent:", alerts)
 
 if __name__ == "__main__":
     main()
